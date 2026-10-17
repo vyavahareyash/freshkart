@@ -27,6 +27,10 @@ def why(m):
         st.markdown("Reasons: " + "; ".join(m["reasons"]))
         lang = m["signals"].get("language")
         if lang: st.markdown(f"🌐 **Language:** `{lang}`")
+        model_used = m["signals"].get("model_used")
+        if model_used:
+            b_color = "green" if model_used == "main" else ("orange" if model_used == "backup" else "red")
+            st.markdown(f":{b_color}[🤖 **Model:** `{model_used}`]")
         if m.get("pii_count", 0) > 0:
             st.markdown(f":violet[🛡️ **PII masked: {m['pii_count']} item(s)**]")
             st.caption("Prompt input sent to LLM:")
@@ -113,9 +117,9 @@ with tab_how:
         ("Cell 10 RunnableLambda", "find_order_id", "Order info in sidebar"),
         ("Cell 12 Lookups", "get_order, get_customer, check_inventory, get_rider", "Why this answer? (signals)"),
         ("Cell 14 assign + memory", "order_id_from", "Order recovered from earlier chat turns"),
-        ("Cell 16 Combined NLU", "nlu_chain, parse_nlu", "Why this answer? (language, intent, sentiment)"),
+        ("Cell 16 Fault-Tolerant NLU", "primary_nlu, backup_nlu", "Why this answer? (intent, language, model)"),
         ("Cell 18 decide_route", "decide_route", "Route badge, Ops queue, metrics"),
-        ("Cell 20 RunnableBranch", "add_note, branch, reply_chain", "Streamed reply in Chat"),
+        ("Cell 20 Robust Lanes", "lane, backup_llm, fallback", "Streamed reply in Chat with fallback"),
         ("Cell 22 Memory", "full_chain, store, get_history", "New chat button"),
         ("Cell 24 Evaluation", "router", "Sample ticket + Send"),
     ], columns=["Notebook cell", "bot.py", "App widget"]))

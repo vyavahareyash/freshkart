@@ -17,12 +17,18 @@ DATA = Path(__file__).parent / "data"
 def get_llm():
     return ChatOpenAI(model=os.getenv("MODEL", "openai/gpt-4o-mini"),
                       base_url="https://openrouter.ai/api/v1",
-                      api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0)
+                      api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0, max_retries=0)
+
+def get_backup_llm():
+    return ChatOpenAI(model=os.getenv("BACKUP_MODEL", "meta-llama/llama-3.1-8b-instruct"),
+                      base_url="https://openrouter.ai/api/v1",
+                      api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0, max_retries=0)
 
 def read(name):
     return pd.read_csv(DATA / f"{name}.csv", dtype=str, keep_default_na=False)
 
 llm = get_llm()
+backup_llm = get_backup_llm()
 orders, customers, inventory, riders, tickets = [read(n) for n in
                                                  ["orders", "customers", "inventory", "riders", "tickets"]]
 TICKETS = tickets.to_dict("records")
@@ -108,20 +114,25 @@ nlu_prompt = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
 ])
 
-def parse_nlu(text):
+def parse_nlu(text, model_name="main"):
     parts = [p.strip().lower() for p in text.strip().split(",")]
     intent = parts[0] if len(parts) > 0 and parts[0] in VALID_INTENTS else "unclear"
     sentiment = parts[1] if len(parts) > 1 and parts[1] in {"angry", "neutral", "happy"} else "neutral"
     language = parts[2] if len(parts) > 2 and parts[2] in LANGUAGES else "english"
-    return {"intent": intent, "sentiment": sentiment, "language": language}
+    return {"intent": intent, "sentiment": sentiment, "language": language, "model_used": model_name}
 
-nlu_chain = RunnableLambda(lambda x: {"input": x["masked_input"]}) | nlu_prompt | llm | StrOutputParser() | RunnableLambda(parse_nlu)
+primary_nlu = (nlu_prompt | llm | StrOutputParser() | RunnableLambda(lambda t: parse_nlu(t, "main"))).with_retry(stop_after_attempt=2)
+backup_nlu = (nlu_prompt | backup_llm | StrOutputParser() | RunnableLambda(lambda t: parse_nlu(t, "backup"))).with_retry(stop_after_attempt=2)
+offline_nlu = RunnableLambda(lambda _: {"intent": "unclear", "sentiment": "neutral", "language": "english", "model_used": "offline_fallback"})
+
+nlu_chain = RunnableLambda(lambda x: {"input": x["masked_input"]}) | primary_nlu.with_fallbacks([backup_nlu, offline_nlu])
 
 oid = lambda f: RunnableLambda(lambda x: f(x["order_id"]))
 signals = RunnableParallel(
     intent=RunnableLambda(lambda x: x["nlu"]["intent"]),
     language=RunnableLambda(lambda x: x["nlu"]["language"]),
     sentiment=RunnableLambda(lambda x: x["nlu"]["sentiment"]),
+    model_used=RunnableLambda(lambda x: x["nlu"]["model_used"]),
     order=oid(get_order), customer=oid(get_customer), inventory=oid(check_inventory), rider=oid(get_rider),
     safety=RunnableLambda(lambda x: has_safety(x["input"])),
     claimed_amount=RunnableLambda(lambda x: claimed_amount(x["input"])),
@@ -182,6 +193,8 @@ LANES = {
     "human_review": "Say a senior agent will contact them soon. Show care if it is about health, mention the Finance team for payments. Do not promise money.",
 }
 
+FALLBACK_REPLY = "Sorry, we're facing a technical issue. A FreshKart agent will contact you shortly."
+
 def lane(instruction):
     p = ChatPromptTemplate.from_messages([
         ("system", "You are a FreshKart support agent. Reply in 2-3 short sentences. "
@@ -191,7 +204,10 @@ def lane(instruction):
         MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
     ])
-    return p | llm | StrOutputParser()
+    primary = (p | llm | StrOutputParser()).with_retry(stop_after_attempt=2)
+    backup = (p | backup_llm | StrOutputParser()).with_retry(stop_after_attempt=2)
+    fallback = RunnableLambda(lambda _: FALLBACK_REPLY)
+    return primary.with_fallbacks([backup, fallback])
 
 branch = RunnableBranch(
     *[(lambda x, name=name: x["route"] == name, lane(text)) for name, text in LANES.items() if name != "human_review"],

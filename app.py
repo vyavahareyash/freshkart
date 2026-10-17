@@ -25,6 +25,12 @@ def why(m):
     with st.expander("Why this answer?"):
         st.markdown(f"Route: :{COLORS[m['route']]}[**{m['route']}**]")
         st.markdown("Reasons: " + "; ".join(m["reasons"]))
+        lang = m["signals"].get("language")
+        if lang: st.markdown(f"🌐 **Language:** `{lang}`")
+        if m.get("pii_count", 0) > 0:
+            st.markdown(f":violet[🛡️ **PII masked: {m['pii_count']} item(s)**]")
+            st.caption("Prompt input sent to LLM:")
+            st.code(m.get("masked_input", ""), language="text")
         st.json(m["signals"])
 
 # Sidebar
@@ -56,14 +62,15 @@ with tab_chat:
                 decision = router.invoke({"input": msg, "chat_history": history.messages})
             reply = st.write_stream(reply_chain.stream(decision))
             m = {"role": "assistant", "content": reply, "route": decision["route"],
-                 "reasons": decision["reasons"], "signals": decision["signals"]}
+                 "reasons": decision["reasons"], "signals": decision["signals"],
+                 "pii_count": decision.get("pii_count", 0), "masked_input": decision.get("masked_input", "")}
             why(m)
-        history.add_user_message(msg)
+        history.add_user_message(decision.get("masked_input", msg))
         history.add_ai_message(reply)
         ss.messages += [{"role": "user", "content": msg}, m]
         ss.log.append({"time": datetime.now().strftime("%H:%M:%S"), "order_id": decision["order_id"],
-                       "intent": decision["signals"]["intent"], "route": decision["route"],
-                       "reasons": "; ".join(decision["reasons"]), "message": msg})
+                       "intent": decision["signals"]["intent"], "language": decision["signals"].get("language", "english"),
+                       "route": decision["route"], "reasons": "; ".join(decision["reasons"]), "message": msg})
 
 with tab_ops:
     cols = st.columns(len(COLORS))
@@ -85,23 +92,28 @@ with tab_how:
     st.code("""
  {input, chat_history}
         |
- RunnableLambda(find_order_id)        regex: FK1001 / fk1001 / ord_1001
+ RunnablePassthrough.assign(masked_input, pii_count)   regex: [PHONE], [EMAIL], [UPI], [CARD]
+        |
+ RunnableLambda(find_order_id)                         regex: FK1001 / fk1001 / ord_1001
+        |
+ RunnablePassthrough.assign(nlu)                       1 LLM call: intent, sentiment, language
         |
  RunnablePassthrough.assign(signals = RunnableParallel(
-        intent (LLM) | order | customer | inventory | rider | safety | claimed_amount ))
+        intent | language | sentiment | order | customer | inventory | rider | safety | claimed_amount ))
         |
- RunnableLambda(decide_route)         plain Python rules, no LLM
+ RunnableLambda(decide_route)                          plain Python rules, no LLM
         |
  RunnableBranch: auto_refund | wismo | substitution | info | policy_decline | human_review
         |
- StrOutputParser -> streamed reply     (memory: RunnableWithMessageHistory)
+ StrOutputParser -> streamed multilingual reply        (memory: RunnableWithMessageHistory)
 """, language="text")
     st.table(pd.DataFrame([
         ("Cell 2 Setup", "get_llm, read", "Data tab"),
+        ("Cell 9 PII Masking", "mask_pii", "Why this answer? (PII badge)"),
         ("Cell 10 RunnableLambda", "find_order_id", "Order info in sidebar"),
         ("Cell 12 Lookups", "get_order, get_customer, check_inventory, get_rider", "Why this answer? (signals)"),
         ("Cell 14 assign + memory", "order_id_from", "Order recovered from earlier chat turns"),
-        ("Cell 16 RunnableParallel", "signals, parse_intent", "Why this answer? (signals)"),
+        ("Cell 16 Combined NLU", "nlu_chain, parse_nlu", "Why this answer? (language, intent, sentiment)"),
         ("Cell 18 decide_route", "decide_route", "Route badge, Ops queue, metrics"),
         ("Cell 20 RunnableBranch", "add_note, branch, reply_chain", "Streamed reply in Chat"),
         ("Cell 22 Memory", "full_chain, store, get_history", "New chat button"),

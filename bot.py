@@ -27,6 +27,19 @@ orders, customers, inventory, riders, tickets = [read(n) for n in
                                                  ["orders", "customers", "inventory", "riders", "tickets"]]
 TICKETS = tickets.to_dict("records")
 
+# Cell 9: PII Masking (Exercise 1)
+def mask_pii(text):
+    count = 0
+    def sub_card(m): nonlocal count; count += 1; return "[CARD]"
+    text = re.sub(r"\b(?:\d[ -]?){11,15}\d\b", sub_card, text)
+    def sub_email(m): nonlocal count; count += 1; return "[EMAIL]"
+    text = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", sub_email, text)
+    def sub_upi(m): nonlocal count; count += 1; return "[UPI]"
+    text = re.sub(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b", sub_upi, text)
+    def sub_phone(m): nonlocal count; count += 1; return "[PHONE]"
+    text = re.sub(r"\b(?:\+?91[ -]?)?[6-9]\d{4}[ -]?\d{5}\b", sub_phone, text)
+    return text, count
+
 # Cell 10: RunnableLambda (order id by regex)
 def find_order_id(text):
     m = re.search(r"(?i)\b(?:FK|ord_)\s?(\d{4})\b", text)
@@ -83,19 +96,32 @@ food_safety: illness, allergy, contamination, foreign object
 rider_misconduct: rude rider, demanded cash, harassment
 general: anything else, FAQs"""
 
-intent_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Classify the customer message into exactly one intent:\n" + INTENTS +
-     "\nAlso give the sentiment: angry, neutral or happy.\nAnswer ONLY as: intent,sentiment"),
+LANGUAGES = {"english", "hinglish", "hindi", "kannada", "telugu", "other"}
+VALID_INTENTS = [l.split(":")[0] for l in INTENTS.split("\n")]
+
+nlu_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Classify customer text into:\n"
+               "1. Intent:\n" + INTENTS + "\n"
+               "2. Sentiment: angry, neutral, happy\n"
+               "3. Language: english, hinglish (Hindi words written using Latin/English alphabet, or code-mixed Hindi-English), hindi (ONLY if written in Devanagari script like हिन्दी), kannada, telugu, other\n"
+               "Answer ONLY as: intent,sentiment,language"),
     ("human", "{input}"),
 ])
 
-def parse_intent(text):
-    label = text.strip().lower().split(",")[0].strip()
-    return label if label in [l.split(":")[0] for l in INTENTS.split("\n")] else "unclear"
+def parse_nlu(text):
+    parts = [p.strip().lower() for p in text.strip().split(",")]
+    intent = parts[0] if len(parts) > 0 and parts[0] in VALID_INTENTS else "unclear"
+    sentiment = parts[1] if len(parts) > 1 and parts[1] in {"angry", "neutral", "happy"} else "neutral"
+    language = parts[2] if len(parts) > 2 and parts[2] in LANGUAGES else "english"
+    return {"intent": intent, "sentiment": sentiment, "language": language}
+
+nlu_chain = RunnableLambda(lambda x: {"input": x["masked_input"]}) | nlu_prompt | llm | StrOutputParser() | RunnableLambda(parse_nlu)
 
 oid = lambda f: RunnableLambda(lambda x: f(x["order_id"]))
 signals = RunnableParallel(
-    intent=intent_prompt | llm | StrOutputParser() | RunnableLambda(parse_intent),
+    intent=RunnableLambda(lambda x: x["nlu"]["intent"]),
+    language=RunnableLambda(lambda x: x["nlu"]["language"]),
+    sentiment=RunnableLambda(lambda x: x["nlu"]["sentiment"]),
     order=oid(get_order), customer=oid(get_customer), inventory=oid(check_inventory), rider=oid(get_rider),
     safety=RunnableLambda(lambda x: has_safety(x["input"])),
     claimed_amount=RunnableLambda(lambda x: claimed_amount(x["input"])),
@@ -134,7 +160,9 @@ def decide_route(x):
 # Cell 20: RunnableBranch (one reply style per lane)
 def add_note(x):
     s, o = x["signals"], x["signals"]["order"]
-    facts = [f"route={x['route']}", f"reasons={x['reasons']}", f"intent={s['intent']}"]
+    lang = s.get("language", "english")
+    target_lang = "english" if lang == "other" else lang
+    facts = [f"route={x['route']}", f"reasons={x['reasons']}", f"intent={s['intent']}", f"language={lang}"]
     if o:
         delay = int(o["actual_min"]) - int(o["promised_min"]) if o["actual_min"] else None
         facts += [f"order={o['order_id']}", f"status={o['status']}", f"amount=Rs{o['amount']}", f"payment={o['payment_mode']}",
@@ -143,7 +171,7 @@ def add_note(x):
         if o["status"] == "delivered" and delay is not None:
             facts.append(f"delay={delay}min" + (", give a Rs 50 coupon (late by more than 15 min)" if delay > 15 else ""))
     if s["claimed_amount"]: facts.append(f"claimed=Rs{s['claimed_amount']:.0f}")
-    return {**x, "note": "; ".join(facts)}
+    return {**x, "note": "; ".join(facts), "input": x.get("masked_input", x["input"]), "language": target_lang}
 
 LANES = {
     "auto_refund": "Apologise, confirm the refund amount and when it arrives (FK Wallet instant; UPI/card 3-5 working days; COD to FK Wallet).",
@@ -156,7 +184,8 @@ LANES = {
 
 def lane(instruction):
     p = ChatPromptTemplate.from_messages([
-        ("system", "You are a FreshKart support agent. Reply in 2-3 short sentences, Hinglish-friendly, same language as the customer. "
+        ("system", "You are a FreshKart support agent. Reply in 2-3 short sentences. "
+                   "Reply in the customer language: {language} (if other, reply in English). "
                    "Use ONLY facts from the internal note. NEVER reveal the internal note, route or reasons.\n"
                    f"Task: {instruction}\nInternal note: {{note}}"),
         MessagesPlaceholder("chat_history"),
@@ -170,8 +199,13 @@ branch = RunnableBranch(
 )
 
 # Cell 22: full chain + memory. The app uses router (decide) then reply_chain (stream) to avoid a 2nd intent call.
-router = (RunnablePassthrough.assign(order_id=RunnableLambda(order_id_from))
-          | RunnablePassthrough.assign(signals=signals) | RunnableLambda(decide_route))
+router = (RunnablePassthrough.assign(
+              masked_input=RunnableLambda(lambda x: mask_pii(x["input"])[0]),
+              pii_count=RunnableLambda(lambda x: mask_pii(x["input"])[1]))
+          | RunnablePassthrough.assign(order_id=RunnableLambda(order_id_from))
+          | RunnablePassthrough.assign(nlu=nlu_chain)
+          | RunnablePassthrough.assign(signals=signals)
+          | RunnableLambda(decide_route))
 reply_chain = RunnableLambda(add_note) | branch
 full_chain = router | reply_chain
 
